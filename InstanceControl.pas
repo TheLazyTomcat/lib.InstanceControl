@@ -25,9 +25,9 @@
     further operation if is is too high. But note that the counter does not
     have any inherent meaning assigned, it is on you how to interpret it.
 
-  Version 1.0 (2022-05-15)
+  Version 1.0 (2022-05-16)
 
-  Last change 2022-05-15
+  Last change 2022-05-16
 
   ©2022 František Milt
 
@@ -61,6 +61,19 @@
 ===============================================================================}
 unit InstanceControl;
 
+{$IF Defined(WINDOWS) or Defined(MSWINDOWS)}
+  {$DEFINE Windows}
+{$ELSEIF Defined(LINUX) and Defined(FPC)}
+  {$DEFINE Linux}
+{$ELSE}
+  {$MESSAGE FATAL 'Unsupported operating system.'}
+{$IFEND}
+
+{$IFDEF FPC}
+  {$MODE ObjFPC}
+{$ENDIF}
+{$H+}
+
 interface
 
 uses
@@ -71,14 +84,19 @@ uses
                                 TInstanceControl
 --------------------------------------------------------------------------------
 ===============================================================================}
+type
+  TICLockedReactionEvent = Function(Sender: TObject): Boolean of object;
+  TICLockedReactionCallback = Function(Sender: TObject): Boolean;
+
 {===============================================================================
     TInstanceControl - class declaration
 ===============================================================================}
 type
   TInstanceControl = class(TCustomObject)
   protected
-    fSection:   TSharedMemory;
-    fInitCount: UInt32;
+    fSection:     TSharedMemory;
+    fInitCount:   UInt32;
+    fProcCounter: Boolean;
     // getters, setters
     Function GetIdentifier: String; virtual;
     Function GetInstanceCount: UInt32; virtual;
@@ -89,10 +107,26 @@ type
     Function GetSharedUserDataPtr: Pointer; virtual;
     Function CurrentProcessID: UInt32; virtual;
     // object init/final
-    procedure Initialize(const Identifier: String); virtual;
+    procedure Initialize(const Identifier: String; LREvent: TICLockedReactionEvent; LRCallback: TICLockedReactionCallback); virtual;
     procedure Finalize; virtual;
   public
-    constructor Create(const Identifier: String); 
+    constructor Create(const Identifier: String); overload;
+  {
+    Use following constructors and LockedReaction event/callback to react to
+    instance counter while it is still inside locked section during creation.
+
+    It is intended for situations where it is desirable to conditionaly prevent
+    counter increment during construction.
+    If you return True from LockedReaction then the creation will continue as
+    usual.
+    But if you return false, then counter will not be incremented (and also
+    decremented when you destroy the object later) - note that creator pid and
+    other fields will also stay unaffected as if nothing happened.
+
+      WARNING - do NOT free/destroy the object from within the LockedReaction.
+  }
+    constructor Create(const Identifier: String; LockedReaction: TICLockedReactionEvent); overload;
+    constructor Create(const Identifier: String; LockedReaction: TICLockedReactionCallback); overload;
     destructor Destroy; override;
   {
     LockSharedMemory and UnlockSharedMemory can be used to protect access to
@@ -119,12 +153,13 @@ type
   }
     property Identifier: String read GetIdentifier;
   {
-    Access to properties InstanceCount through LastAccessTime is protected
-    by a lock, so it is thread safe - but note that whatever is returned is
-    a value that WAS stored during the lock, it might have been changed by the
-    time the property getter returns.
+    Properties InstanceCount through LastAccessTime are directly accessing data
+    stored in shared memory, and this access is protected by a lock (so it is
+    thread safe) - but note that whatever is returned is a value that WAS
+    stored during the lock, it might have been changed by the time the property
+    getter returns.
 
-    Instance count contains number of existing instances of TInstanceControl
+    InstanceCount contains number of existing instances of TInstanceControl
     with givent identifier within the system.
 
     CreatorPID contains process id of process that first created instance
@@ -162,7 +197,7 @@ type
 implementation
 
 uses
-  Windows, SysUtils;
+  {$IFDEF Windows}Windows,{$ELSE}BaseUnix,{$ENDIF} SysUtils;
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -266,12 +301,12 @@ end;
 
 Function TInstanceControl.CurrentProcessID: UInt32;
 begin
-Result := UInt32(GetCurrentProcessID);
+Result := UInt32({$IFDEF Windows}GetCurrentProcessID{$ELSE}fpgetpid{$ENDIF});
 end;
 
 //------------------------------------------------------------------------------
 
-procedure TInstanceControl.Initialize(const Identifier: String);
+procedure TInstanceControl.Initialize(const Identifier: String; LREvent: TICLockedReactionEvent; LRCallback: TICLockedReactionCallback);
 var
   SharedDataPtr:  PICSharedData;
 begin
@@ -280,12 +315,21 @@ fSection.Lock;
 try
   SharedDataPtr := fSection.Memory;
   fInitCount := SharedDataPtr^.InstanceCount;
-  Inc(SharedDataPtr^.InstanceCount);
-  SharedDataPtr^.LastAccessTime := Now;
-  If PICSharedData(fSection.Memory)^.InstanceCount = 1 then
+  If Assigned(LREvent) then
+    fProcCounter := LREvent(Self)
+  else If Assigned(LRCallback) then
+    fProcCounter := LRCallback(Self)
+  else
+    fProcCounter := True;
+  If fProcCounter then
     begin
-      SharedDataPtr^.CreatorPID := CurrentProcessID;
-      SharedDataPtr^.CreationTime := SharedDataPtr^.LastAccessTime;
+      Inc(SharedDataPtr^.InstanceCount);
+      SharedDataPtr^.LastAccessTime := Now;
+      If PICSharedData(fSection.Memory)^.InstanceCount = 1 then
+        begin
+          SharedDataPtr^.CreatorPID := CurrentProcessID;
+          SharedDataPtr^.CreationTime := SharedDataPtr^.LastAccessTime;
+        end;
     end;
 finally
   fSection.Unlock;
@@ -301,9 +345,12 @@ begin
 fSection.Lock;
 try
   SharedDataPtr := fSection.Memory;
-  Dec(SharedDataPtr^.InstanceCount);
-  If SharedDataPtr^.CreatorPID = CurrentProcessID then
-    SharedDataPtr^.CreatorPID := UInt32(-1);
+  If fProcCounter then
+    begin
+      Dec(SharedDataPtr^.InstanceCount);
+      If SharedDataPtr^.CreatorPID = CurrentProcessID then
+        SharedDataPtr^.CreatorPID := UInt32(-1);
+    end;
 finally
   fSection.Unlock;
 end;
@@ -317,7 +364,23 @@ end;
 constructor TInstanceControl.Create(const Identifier: String);
 begin
 inherited Create;
-Initialize(Identifier);
+Initialize(Identifier,nil,nil);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TInstanceControl.Create(const Identifier: String; LockedReaction: TICLockedReactionEvent);
+begin
+inherited Create;
+Initialize(Identifier,LockedReaction,nil);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+constructor TInstanceControl.Create(const Identifier: String; LockedReaction: TICLockedReactionCallback);
+begin
+inherited Create;
+Initialize(Identifier,nil,LockedReaction);
 end;
 
 //------------------------------------------------------------------------------
